@@ -1,0 +1,1157 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+tmux-snap — capture, restore, and manage tmux state snapshots.
+
+Subcommands:
+  save     [--name NAME] [--lines N] [--force] [-v]      take a snapshot
+  restore  [--name NAME|--latest] [--dry-run] [--ask] [-v] [--target-{width,height} N]
+  list                                                   list snapshots
+  inspect  [--name NAME|--latest] [--pane ADDR]          show snapshot details
+  watch    [--interval DUR] [--keep N] [--lines N] [-v]  rolling auto-snapshots
+
+Default snapshot directory:
+  $TMUX_SNAP_DIR, else $XDG_DATA_HOME/tmux-snap, else ~/.local/share/tmux-snap
+
+Layout per snapshot:
+  <dir>/<name>/snapshot.json
+  <dir>/<name>/scrollback/<sess>_<win>_<pane>.raw
+  <dir>/<name>/init/<sess>_<win>_<pane>.sh   (created on restore)
+  <dir>/latest                               symlink to most-recent snapshot
+"""
+import argparse, datetime, json, os, pathlib, re, shlex, shutil, signal, subprocess, sys, time
+from collections import Counter
+
+
+# ---------- terminal styling ----------
+
+def _color_enabled():
+    if os.environ.get('NO_COLOR'):
+        return False
+    return sys.stdout.isatty()
+
+USE_COLOR = _color_enabled()
+
+def _c(s, code):
+    return f'\033[{code}m{s}\033[0m' if USE_COLOR else s
+
+def bold(s):  return _c(s, '1')
+def dim(s):   return _c(s, '2')
+def cyan(s):  return _c(s, '36')
+def green(s): return _c(s, '32')
+def yellow(s):return _c(s, '33')
+def red(s):   return _c(s, '31')
+
+HOME_PATH = str(pathlib.Path.home())
+
+def tildefy(p):
+    if p and p == HOME_PATH:
+        return '~'
+    if p and p.startswith(HOME_PATH + '/'):
+        return '~' + p[len(HOME_PATH):]
+    return p or ''
+
+def term_width(default=80):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+def banner(title):
+    w = min(term_width(), 80)
+    bar = '═' * w
+    sys.stdout.write(cyan(bar) + '\n')
+    sys.stdout.write('  ' + bold(title) + '\n')
+    sys.stdout.write(cyan(bar) + '\n')
+
+def section(title):
+    w = min(term_width(), 80)
+    line = '─── ' + title + ' '
+    line += '─' * max(3, w - len(line))
+    sys.stdout.write('\n' + cyan(line) + '\n\n')
+
+def kv(label, value, label_w=12):
+    sys.stdout.write(f'  {dim(label.ljust(label_w))}  {value}\n')
+
+def truncate(s, n):
+    return s if len(s) <= n else s[:n - 1] + '…'
+
+def relative_time(iso):
+    try:
+        t = datetime.datetime.fromisoformat(iso)
+        delta = datetime.datetime.now().astimezone() - t
+        s = int(delta.total_seconds())
+        if s < 0: return 'in the future'
+        if s < 60: return f'{s}s ago'
+        if s < 3600: return f'{s // 60}m ago'
+        if s < 86400: return f'{s // 3600}h ago'
+        return f'{s // 86400}d ago'
+    except Exception:
+        return ''
+
+def role_tag(role, restorable=True):
+    """Return a fixed-width colored role tag like [claude     ]."""
+    text = f'{role:<11}'
+    if role == 'claude':            return _c(f'[{text}]', '35')   # magenta
+    if role in ('shell',):          return dim(f'[{text}]')
+    if role in ('editor',):         return yellow(f'[{text}]')
+    if role in ('other',):          return red(f'[{text}]')
+    if restorable:                  return green(f'[{text}]')
+    return f'[{text}]'
+
+
+# ---------- defaults & helpers ----------
+
+def default_root():
+    if os.environ.get('TMUX_SNAP_DIR'):
+        return pathlib.Path(os.environ['TMUX_SNAP_DIR'])
+    xdg = os.environ.get('XDG_DATA_HOME')
+    base = pathlib.Path(xdg) if xdg else pathlib.Path.home() / '.local' / 'share'
+    return base / 'tmux-snap'
+
+
+VERBOSE = False
+DRY_RUN = False
+
+
+def vlog(msg):
+    if VERBOSE:
+        sys.stderr.write(f'[tmux-snap] {msg}\n')
+
+
+def tmux(*args, capture=True, check=True):
+    if VERBOSE:
+        vlog('tmux ' + ' '.join(shlex.quote(a) for a in args))
+    if DRY_RUN:
+        sys.stdout.write('tmux ' + ' '.join(shlex.quote(a) for a in args) + '\n')
+        return ''
+    r = subprocess.run(['tmux', *args], capture_output=capture, text=True)
+    if check and r.returncode != 0:
+        # tmux 3.x reports "no current client" with rc=1 for several commands
+        # (notably new-window, set-option) when no client is attached, even
+        # though the operation actually succeeds. Treat that as success.
+        if 'no current client' in (r.stderr or ''):
+            vlog(f'tmux {args!r} returned "no current client" (ignored)')
+            return r.stdout if capture else ''
+        raise RuntimeError(f'tmux {args!r} failed: {r.stderr.strip()}')
+    return r.stdout if capture else ''
+
+
+def tmux_query(*args):
+    """Like tmux() but always executes (never dry-run) and never logs."""
+    r = subprocess.run(['tmux', *args], capture_output=True, text=True, check=True)
+    return r.stdout
+
+
+def parse_duration(s):
+    m = re.fullmatch(r'(\d+)([smhd])?', s.strip())
+    if not m:
+        raise ValueError(f'bad duration {s!r}')
+    n = int(m.group(1))
+    unit = m.group(2) or 's'
+    return n * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[unit]
+
+
+def auto_name():
+    return datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+
+
+def fmt_age(seconds):
+    s = int(seconds)
+    if s < 60: return f'{s}s'
+    if s < 3600: return f'{s // 60}m'
+    if s < 86400: return f'{s // 3600}h'
+    return f'{s // 86400}d'
+
+
+# ---------- process classification (save) ----------
+
+def ps_tree():
+    out = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,command='],
+                         capture_output=True, text=True, check=True).stdout
+    tree = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, cmd = int(parts[0]), int(parts[1]), parts[2]
+        tree.setdefault(ppid, []).append((pid, cmd))
+    return tree
+
+
+def descendants(tree, root_pid):
+    out, stack = [], [root_pid]
+    while stack:
+        cur = stack.pop()
+        for pid, cmd in tree.get(cur, []):
+            out.append((pid, cmd))
+            stack.append(pid)
+    return out
+
+
+def lookup_claude_session(pid):
+    f = pathlib.Path.home() / '.claude' / 'sessions' / f'{pid}.json'
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return None
+
+
+RESTORE_POLICIES = [(label, re.compile(rx)) for label, rx in [
+    ('watch',          r'watch\b'),
+    ('caffeinate',     r'caffeinate\b'),
+    ('http_server',    r'(python\S*|uv\s+run)\s+(-m\s+)?http\.server\b'),
+    ('tail_f',         r'tail\s+(-\w*f\w*|.+\s-f)\b'),
+    ('journalctl_f',   r'journalctl\b.*\s-f\b'),
+    ('docker_logs_f',  r'docker(\s+compose)?\s+logs\b.*\s-f\b'),
+    ('kubectl_logs_f', r'kubectl\s+logs\b.*\s-f\b'),
+    ('kubectl_watch',  r'kubectl\s+get\b.*\s-w\b'),
+    ('monitor',        r'(htop|btop|atop|top)\b'),
+    ('ssh',            r'(ssh|mosh)\b'),
+    ('db_repl',        r'(psql|mysql|redis-cli|sqlite3|bq)\b'),
+    ('pager',          r'(less|bat|more|man)\b'),
+]]
+NON_RESTORE_LABELS = {'editor': re.compile(r'(vim?|nvim|emacs|nano|hx|helix)\b')}
+SHELL_BASES = {'zsh', 'bash', '-zsh', '-bash', 'sh', 'fish'}
+
+
+def find_foreground(pane_pid, current_command, tree):
+    descs = descendants(tree, pane_pid)
+    if current_command:
+        cc_base = current_command.split()[0]
+        for pid, cmd in descs:
+            head = cmd.split()[0] if cmd.split() else ''
+            base = os.path.basename(head)
+            if (base == cc_base or head == cc_base
+                    or cmd.startswith(current_command + ' ')
+                    or cmd == current_command):
+                return pid, cmd
+    for pid, cmd in reversed(descs):
+        base = os.path.basename(cmd.split()[0]) if cmd.split() else ''
+        if base not in SHELL_BASES:
+            return pid, cmd
+    return pane_pid, current_command or ''
+
+
+def classify(pane_pid, current_command, tree):
+    descs = descendants(tree, pane_pid)
+    for pid, cmd in descs:
+        if os.path.basename(cmd.split()[0] if cmd.split() else '') == 'claude':
+            sess = lookup_claude_session(pid)
+            block = None
+            if sess:
+                block = {
+                    'pid': pid, 'argv': cmd,
+                    'session_id': sess.get('sessionId'),
+                    'cwd': sess.get('cwd'),
+                    'version': sess.get('version'),
+                    'name': sess.get('name'),
+                    'status': sess.get('status'),
+                }
+            # claude -r must run from the cwd the session was originally
+            # started in, which may differ from the pane's current cwd.
+            b = None
+            if block and block.get('session_id'):
+                resume = f'claude -r {block["session_id"]}'
+                if block.get('cwd'):
+                    b = f'cd {shlex.quote(block["cwd"])} && {resume}'
+                else:
+                    b = resume
+            return {'role': 'claude', 'label': 'claude', 'b_command': b,
+                    'fg_argv': cmd, 'restorable': bool(b), 'claude': block}
+
+    fg_pid, fg_argv = find_foreground(pane_pid, current_command, tree)
+    parts = fg_argv.split() if fg_argv else []
+    head = parts[0] if parts else ''
+    base = os.path.basename(head).lstrip('-')
+    norm_argv = ' '.join([base, *parts[1:]]) if parts else ''
+
+    if base in SHELL_BASES and len(parts) <= 1:
+        return {'role': 'shell', 'label': 'idle_shell', 'b_command': None,
+                'fg_argv': fg_argv, 'restorable': True, 'claude': None}
+
+    def matches(rx):
+        return rx.match(norm_argv) or rx.match(fg_argv) or rx.match(base)
+
+    for label, rx in RESTORE_POLICIES:
+        if matches(rx):
+            return {'role': label, 'label': label, 'b_command': norm_argv,
+                    'fg_argv': fg_argv, 'restorable': True, 'claude': None}
+    for label, rx in NON_RESTORE_LABELS.items():
+        if matches(rx):
+            return {'role': label, 'label': label, 'b_command': None,
+                    'fg_argv': fg_argv, 'restorable': False, 'claude': None}
+    return {'role': 'other', 'label': 'other', 'b_command': None,
+            'fg_argv': fg_argv, 'restorable': False, 'claude': None}
+
+
+# ---------- layout parser/serializer (restore) ----------
+
+def layout_csum(s):
+    c = 0
+    for ch in s.encode():
+        c = ((c >> 1) | ((c & 1) << 15)) & 0xFFFF
+        c = (c + ch) & 0xFFFF
+    return f'{c:04x}'
+
+
+def parse_layout(s):
+    assert s[4] == ','
+    cell, end = _parse_cell(s, 5)
+    assert end == len(s)
+    return cell
+
+
+def _parse_cell(s, i):
+    j = s.index('x', i); w = int(s[i:j])
+    k = s.index(',', j); h = int(s[j+1:k])
+    m = s.index(',', k+1); x = int(s[k+1:m])
+    n = m + 1
+    while n < len(s) and s[n] not in ',{}[]':
+        n += 1
+    y = int(s[m+1:n])
+    cell = {'w': w, 'h': h, 'x': x, 'y': y, 'kind': 'leaf',
+            'children': [], 'paneid': None}
+    if n >= len(s) or s[n] in '}],':
+        if n < len(s) and s[n] == ',':
+            ts = n + 1
+            te = ts
+            while te < len(s) and s[te].isdigit():
+                te += 1
+            term = s[te] if te < len(s) else ''
+            if te > ts and term in ',}]' or (te > ts and term == ''):
+                cell['paneid'] = int(s[ts:te])
+                return cell, te
+        return cell, n
+    if s[n] in '{[':
+        cell['kind'] = 'h' if s[n] == '{' else 'v'
+        close = '}' if s[n] == '{' else ']'
+        n += 1
+        while True:
+            child, n = _parse_cell(s, n)
+            cell['children'].append(child)
+            if s[n] == ',':
+                n += 1; continue
+            if s[n] == close:
+                n += 1; break
+        return cell, n
+    raise ValueError(f'parse error at {n}: {s[n:n+10]!r}')
+
+
+def serialize_cell(cell):
+    s = f'{cell["w"]}x{cell["h"]},{cell["x"]},{cell["y"]}'
+    if cell['kind'] == 'leaf':
+        if cell['paneid'] is not None:
+            s += f',{cell["paneid"]}'
+        return s
+    o, c = ('{', '}') if cell['kind'] == 'h' else ('[', ']')
+    return s + o + ','.join(serialize_cell(ch) for ch in cell['children']) + c
+
+
+def _propagate(cell):
+    if cell['kind'] == 'leaf':
+        return
+    n = len(cell['children'])
+    if cell['kind'] == 'h':
+        total = cell['w']
+        ws = [c['w'] for c in cell['children']]
+        s = sum(ws) or 1
+        used = 0
+        for i, c in enumerate(cell['children']):
+            c['w'] = total - used if i == n - 1 else max(1, round(ws[i] / s * total))
+            used += c['w']
+            c['h'] = cell['h']
+        off = cell['x']
+        for c in cell['children']:
+            c['x'] = off; c['y'] = cell['y']; _propagate(c); off += c['w']
+    else:
+        total = cell['h']
+        hs = [c['h'] for c in cell['children']]
+        s = sum(hs) or 1
+        used = 0
+        for i, c in enumerate(cell['children']):
+            c['h'] = total - used if i == n - 1 else max(1, round(hs[i] / s * total))
+            used += c['h']
+            c['w'] = cell['w']
+        off = cell['y']
+        for c in cell['children']:
+            c['y'] = off; c['x'] = cell['x']; _propagate(c); off += c['h']
+
+
+def _scale_naive(cell, sx, sy):
+    cell['w'] = max(1, round(cell['w'] * sx))
+    cell['h'] = max(1, round(cell['h'] * sy))
+    for c in cell['children']:
+        _scale_naive(c, sx, sy)
+
+
+def rescale_layout(layout, target_w, target_h):
+    root = parse_layout(layout)
+    sx = target_w / root['w']; sy = target_h / root['h']
+    _scale_naive(root, sx, sy)
+    root['w'] = target_w; root['h'] = target_h; root['x'] = 0; root['y'] = 0
+    _propagate(root)
+    body = serialize_cell(root)
+    return f'{layout_csum(body)},{body}'
+
+
+# ---------- snapshot directory helpers ----------
+
+def snapshots_in(root):
+    if not root.exists():
+        return []
+    out = []
+    for d in sorted(root.iterdir()):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        sj = d / 'snapshot.json'
+        if not sj.exists():
+            continue
+        try:
+            data = json.loads(sj.read_text())
+        except Exception:
+            continue
+        out.append((d, data))
+    out.sort(key=lambda x: x[1].get('captured_at', ''))
+    return out
+
+
+def resolve_snapshot(root, name=None, latest=False):
+    if name and latest:
+        sys.exit('error: --name and --latest are mutually exclusive')
+    if name:
+        path = root / name
+        if not (path / 'snapshot.json').exists():
+            sys.exit(f'error: snapshot {name!r} not found in {root}')
+        return path
+    if latest or name is None:
+        link = root / 'latest'
+        if link.is_symlink() or link.exists():
+            target = link.resolve()
+            if (target / 'snapshot.json').exists():
+                return target
+        snaps = snapshots_in(root)
+        if not snaps:
+            sys.exit(f'error: no snapshots in {root}')
+        return snaps[-1][0]
+
+
+def update_latest(root, name):
+    link = root / 'latest'
+    if link.is_symlink() or link.exists():
+        try:
+            link.unlink()
+        except Exception:
+            pass
+    link.symlink_to(name)
+
+
+# ---------- save ----------
+
+def do_save(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    root = pathlib.Path(args.dir)
+    root.mkdir(parents=True, exist_ok=True)
+
+    name = args.name or auto_name()
+    snap_dir = root / name
+    if snap_dir.exists():
+        if not args.force:
+            sys.exit(f'error: snapshot {name!r} already exists at {snap_dir} '
+                     f'(use --force to overwrite)')
+        # Force: wipe contents.
+        import shutil
+        shutil.rmtree(snap_dir)
+    snap_dir.mkdir(parents=True)
+    sb_dir = snap_dir / 'scrollback'
+    sb_dir.mkdir()
+
+    tree = ps_tree()
+    sessions_raw = tmux_query('list-sessions', '-F',
+                              '#{session_id}\t#{session_name}\t#{session_attached}'
+                              ).strip().splitlines()
+
+    snapshot = {
+        'name': name,
+        'captured_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+        'scrollback_lines': args.lines,
+        'tmux_version': tmux_query('-V').strip(),
+        'host': os.uname().nodename,
+        'sessions': [],
+    }
+
+    restorable = Counter()
+    idle_shells = 0
+    non_restorable = []
+
+    for line in sessions_raw:
+        sid, sname, attached = line.split('\t')
+        sess = {'id': sid, 'name': sname, 'attached': attached == '1', 'windows': []}
+        wins_raw = tmux_query('list-windows', '-t', sid, '-F',
+                              '\t'.join(['#{window_index}', '#{window_name}',
+                                         '#{window_active}', '#{window_width}',
+                                         '#{window_height}', '#{window_layout}'])
+                              ).strip().splitlines()
+        for w in wins_raw:
+            wi, wn, wa, ww, wh, wl = w.split('\t')
+            win = {'index': int(wi), 'name': wn, 'active': wa == '1',
+                   'width': int(ww), 'height': int(wh), 'layout': wl, 'panes': []}
+            panes_raw = tmux_query('list-panes', '-t', f'{sid}:{wi}', '-F',
+                                   '\t'.join(['#{pane_id}', '#{pane_index}',
+                                              '#{pane_active}', '#{pane_pid}',
+                                              '#{pane_current_command}',
+                                              '#{pane_current_path}', '#{pane_left}',
+                                              '#{pane_top}', '#{pane_width}',
+                                              '#{pane_height}', '#{pane_title}'])
+                                   ).strip().splitlines()
+            for p in panes_raw:
+                fields = p.split('\t')
+                (pid_, pidx, pact, ppid_, pcmd, pcwd,
+                 pl_, pt_, pw_, ph_, ptitle) = fields
+                sb_name = f'{sname}_{wi}_{pidx}.raw'
+                sb_path = sb_dir / sb_name
+                cap = subprocess.run(['tmux', 'capture-pane', '-e', '-J', '-p',
+                                      '-S', f'-{args.lines}', '-t', pid_],
+                                     capture_output=True, check=True).stdout
+                sb_path.write_bytes(cap)
+
+                info = classify(int(ppid_), pcmd, tree)
+                pane = {
+                    'id': pid_, 'index': int(pidx), 'active': pact == '1',
+                    'pid': int(ppid_), 'current_command': pcmd, 'cwd': pcwd,
+                    'left': int(pl_), 'top': int(pt_),
+                    'width': int(pw_), 'height': int(ph_),
+                    'title': ptitle, 'role': info['role'],
+                    'restore_label': info['label'],
+                    'b_command': info['b_command'],
+                    'foreground': info['fg_argv'],
+                    'scrollback_file': str(sb_path.relative_to(snap_dir)),
+                    'claude': info['claude'],
+                }
+                win['panes'].append(pane)
+                addr = f'{sname}:{wi}.{pidx}'
+                if info['label'] == 'idle_shell':
+                    idle_shells += 1
+                elif info['restorable']:
+                    restorable[info['label']] += 1
+                else:
+                    non_restorable.append({'address': addr, 'fg_argv': info['fg_argv'],
+                                           'title': ptitle, 'role': info['role'],
+                                           'cwd': pcwd})
+            sess['windows'].append(win)
+        snapshot['sessions'].append(sess)
+
+    snapshot['stats'] = {'restorable_counts': dict(restorable),
+                         'idle_shells': idle_shells,
+                         'non_restorable_panes': non_restorable}
+
+    # Atomic write.
+    tmp = snap_dir / 'snapshot.json.tmp'
+    tmp.write_text(json.dumps(snapshot, indent=2))
+    tmp.rename(snap_dir / 'snapshot.json')
+
+    update_latest(root, name)
+
+    n_panes = sum(len(w['panes']) for s in snapshot['sessions'] for w in s['windows'])
+    n_wins = sum(len(s['windows']) for s in snapshot['sessions'])
+    n_sess = len(snapshot['sessions'])
+    print(f'Saved snapshot {name!r} → {snap_dir}')
+    print(f'  {n_sess} session(s), {n_wins} window(s), {n_panes} pane(s)')
+    print()
+    print('Captured panes that CAN be restored on `tmux-snap restore`:')
+    print(f'  idle shells: {idle_shells}  (will reopen as plain zsh at original cwd)')
+    if restorable:
+        width = max(len(k) for k in restorable) + 1
+        for label in sorted(restorable, key=lambda k: -restorable[k]):
+            print(f'  {label:<{width}}  {restorable[label]}')
+    else:
+        print('  (no foreground processes recognized for relaunch)')
+    print()
+    print(f'Captured panes that will NOT be relaunched ({len(non_restorable)}) '
+          f'— scrollback only:')
+    if non_restorable:
+        for u in non_restorable:
+            argv = u['fg_argv'] or '(unknown)'
+            argv = argv if len(argv) <= 90 else argv[:87] + '…'
+            print(f'  {u["address"]:<14} [{u["role"]}]  {argv}')
+            if u['title'] and u['title'] != argv:
+                t = u['title'][:90] + ('…' if len(u['title']) > 90 else '')
+                print(f'  {"":<14}   title: {t}')
+    else:
+        print('  (none)')
+
+
+# ---------- restore ----------
+
+def make_init_script(init_dir, key, cwd, sb_path, b_command):
+    p = init_dir / f'{key}.sh'
+    sh = ['#!/bin/bash',
+          f'cd {shlex.quote(cwd)} 2>/dev/null || true',
+          f'cat {shlex.quote(str(sb_path))} 2>/dev/null',
+          r'printf "\n\033[2;3m=== restored scrollback above ===\033[0m\n"']
+    if b_command:
+        sh.append(b_command)
+    sh.append(f'cd {shlex.quote(cwd)} 2>/dev/null || true')
+    sh.append('exec zsh')
+    p.write_text('\n'.join(sh) + '\n')
+    p.chmod(0o755)
+    return p
+
+
+def do_restore(args):
+    global VERBOSE, DRY_RUN
+    VERBOSE = args.verbose
+    DRY_RUN = args.dry_run
+
+    if os.environ.get('TMUX') and not args.force and not args.dry_run:
+        sys.exit(
+            'error: refusing to restore from inside tmux ($TMUX is set).\n'
+            '  Restoring from inside tmux is fragile: session-name collisions are '
+            'likely,\n'
+            '  layout sizing uses the wrong dimensions, and `send-keys` targeting '
+            'can race.\n'
+            '  Detach first (Ctrl-b d) and run from a plain shell, or pass --force '
+            'to override.'
+        )
+
+    root = pathlib.Path(args.dir)
+    snap_dir = resolve_snapshot(root, args.name, args.latest)
+    snap = json.loads((snap_dir / 'snapshot.json').read_text())
+
+    # Target client size.
+    if args.target_width and args.target_height:
+        tw, th = args.target_width, args.target_height
+    else:
+        try:
+            sz = os.get_terminal_size()
+            tw = args.target_width or sz.columns
+            th = args.target_height or sz.lines
+        except OSError:
+            tw, th = args.target_width or 200, args.target_height or 50
+
+    # --ask: prompt about each unrestored pane.
+    promoted = {}  # address → b_command
+    if args.ask and not DRY_RUN:
+        nrp = (snap.get('stats', {}).get('non_restorable_panes')
+               or snap.get('stats', {}).get('unrestored', []))
+        if nrp:
+            print(f'{len(nrp)} pane(s) have no restore policy. '
+                  f'Relaunch each with its captured argv?')
+            for u in nrp:
+                argv = u['fg_argv'] or '(unknown)'
+                ans = input(f'  {u["address"]:<14} [{u["role"]}]  {argv}\n'
+                            f'    relaunch? [y/N] ').strip().lower()
+                if ans in ('y', 'yes'):
+                    promoted[u['address']] = argv
+
+    init_dir = snap_dir / 'init'
+    init_dir.mkdir(exist_ok=True)
+
+    # Kill any conflicting sessions up front (with --force). Doing this before
+    # setting options matters: killing the last session kills the server,
+    # which would wipe any options we set first.
+    if not DRY_RUN and args.force:
+        for sess in snap['sessions']:
+            sname = sess['name']
+            if subprocess.run(['tmux', 'has-session', '-t', f'={sname}'],
+                              capture_output=True).returncode == 0:
+                print(f'Session {sname!r} exists; killing it (--force).', file=sys.stderr)
+                subprocess.run(['tmux', 'kill-session', '-t', f'={sname}'])
+
+    for sess in snap['sessions']:
+        sname = sess['name']
+        if not DRY_RUN:
+            existing = subprocess.run(['tmux', 'has-session', '-t', f'={sname}'],
+                                      capture_output=True).returncode == 0
+            if existing:
+                print(f'Session {sname!r} already exists; skipping.', file=sys.stderr)
+                continue
+
+        first_window = True
+        for win in sess['windows']:
+            wname = win['name']; wi = win['index']
+            first_pane = win['panes'][0]
+            if first_window:
+                tmux('new-session', '-d', '-s', sname, '-n', wname,
+                     '-x', str(tw), '-y', str(th), '-c', first_pane['cwd'])
+                if not DRY_RUN:
+                    actual = tmux_query('list-windows', '-t', sname, '-F',
+                                        '#{window_index}').strip().split()[0]
+                    if actual != str(wi):
+                        tmux('move-window', '-s', f'{sname}:{actual}',
+                             '-t', f'{sname}:{wi}')
+                first_window = False
+            else:
+                tmux('new-window', '-t', f'{sname}:{wi}', '-n', wname,
+                     '-c', first_pane['cwd'])
+            target_window = f'{sname}:{wi}'
+            # New windows in a detached session may come up at tmux's minimum
+            # size (window-size=latest with no client). Resize to match the
+            # session so split-window has room.
+            tmux('resize-window', '-t', f'{sname}:{wi}', '-x', str(tw), '-y', str(th))
+            # Split repeatedly: always split the currently-largest pane along
+            # its longer axis so we don't run out of space when the window has
+            # many panes. select-layout below will rearrange to the snapshot.
+            for pane in win['panes'][1:]:
+                if not DRY_RUN:
+                    info = tmux_query('list-panes', '-t', target_window,
+                                      '-F', '#{pane_index} #{pane_width} #{pane_height}').strip().splitlines()
+                    biggest = max(info, key=lambda l: int(l.split()[1]) * int(l.split()[2]))
+                    pi, pw, ph = biggest.split()
+                    direction = '-h' if int(pw) >= int(ph) * 2 else '-v'
+                    tmux('split-window', direction, '-t', f'{target_window}.{pi}',
+                         '-c', pane['cwd'])
+                else:
+                    tmux('split-window', '-t', target_window, '-c', pane['cwd'])
+            try:
+                scaled = rescale_layout(win['layout'], tw, th)
+                tmux('select-layout', '-t', target_window, scaled)
+            except Exception as e:
+                vlog(f'layout scale failed ({e}); using original')
+                try:
+                    tmux('select-layout', '-t', target_window, win['layout'])
+                except Exception:
+                    pass
+            for i, pane in enumerate(win['panes']):
+                pane_target = f'{target_window}.{i}'
+                key = f'{sname}_{wi}_{i}'
+                sb_path = (snap_dir / pane['scrollback_file']).resolve()
+                b = pane.get('b_command')
+                addr = f'{sname}:{wi}.{pane["index"]}'
+                if not b and addr in promoted:
+                    b = promoted[addr]
+                init_path = make_init_script(init_dir, key, pane['cwd'], sb_path, b)
+                tmux('send-keys', '-t', pane_target,
+                     f'exec bash {shlex.quote(str(init_path))}', 'Enter')
+            for i, pane in enumerate(win['panes']):
+                if pane['active']:
+                    tmux('select-pane', '-t', f'{target_window}.{i}')
+                    break
+        for win in sess['windows']:
+            if win['active']:
+                tmux('select-window', '-t', f'{sname}:{win["index"]}')
+                break
+
+    if DRY_RUN:
+        print('# dry run: no tmux commands were executed.', file=sys.stderr)
+    else:
+        sname0 = snap['sessions'][0]['name'] if snap['sessions'] else ''
+        print(f'Restored {snap.get("name", snap_dir.name)!r}. '
+              f'Attach with:  tmux attach -t {sname0}')
+
+
+# ---------- list ----------
+
+def do_list(args):
+    root = pathlib.Path(args.dir)
+    snaps = snapshots_in(root)
+    latest_target = None
+    link = root / 'latest'
+    if link.is_symlink():
+        try:
+            latest_target = link.resolve().name
+        except Exception:
+            pass
+    if not snaps:
+        print(f'(no snapshots in {root})')
+        return
+    now = datetime.datetime.now().astimezone()
+    print(f'{"NAME":<26} {"AGE":>6}  {"S":>2} {"W":>3} {"P":>4}  '
+          f'{"RESTORABLE":<26} {"N-RST":>5}')
+    for path, data in snaps:
+        name = path.name
+        age = ''
+        try:
+            t = datetime.datetime.fromisoformat(data['captured_at'])
+            age = fmt_age((now - t).total_seconds())
+        except Exception:
+            pass
+        n_s = len(data.get('sessions', []))
+        n_w = sum(len(s.get('windows', [])) for s in data.get('sessions', []))
+        n_p = sum(len(w.get('panes', []))
+                  for s in data.get('sessions', [])
+                  for w in s.get('windows', []))
+        stats = data.get('stats', {})
+        # Backward-compat with old key names.
+        restorable = stats.get('restorable_counts', stats.get('restored_counts', {}))
+        idle = stats.get('idle_shells', 0)
+        non_rest = len(stats.get('non_restorable_panes',
+                                 stats.get('unrestored', [])))
+        items = sorted(restorable.items(), key=lambda kv: -kv[1])
+        bits = [f'{k}:{v}' for k, v in items[:3]]
+        if len(items) > 3:
+            bits.append('…')
+        if idle:
+            bits.append(f'idle:{idle}')
+        rest_str = ' '.join(bits)
+        rest_str = rest_str if len(rest_str) <= 26 else rest_str[:25] + '…'
+        marker = ' *' if latest_target == name else ''
+        print(f'{name + marker:<26} {age:>6}  {n_s:>2} {n_w:>3} {n_p:>4}  '
+              f'{rest_str:<26} {non_rest:>5}')
+
+
+# ---------- inspect ----------
+
+def _show_pane_detail(snap_dir, address, pane):
+    banner(f'Pane  {address}')
+    sys.stdout.write('\n')
+    cl = pane.get('claude')
+    role_line = pane['role']
+    if pane.get('restore_label') and pane['restore_label'] != pane['role']:
+        role_line += dim(f"  ({pane['restore_label']})")
+    kv('role', role_line)
+    kv('cwd', tildefy(pane['cwd']))
+    kv('geometry', f'left={pane["left"]} top={pane["top"]}  '
+                   f'{pane["width"]}×{pane["height"]}')
+    kv('active', green('yes') if pane.get('active') else dim('no'))
+    if pane.get('title'):
+        kv('title', truncate(pane['title'], term_width() - 18))
+    kv('foreground', truncate(pane.get('foreground') or '', term_width() - 18))
+    bcmd = pane.get('b_command') or dim('(none — scrollback only)')
+    kv('b_command', truncate(bcmd, term_width() - 18))
+    if cl:
+        section('Claude session')
+        kv('session_id', cl.get('session_id') or '?')
+        kv('cwd', tildefy(cl.get('cwd') or ''))
+        kv('version', cl.get('version') or '?')
+        kv('status', cl.get('status') or '?')
+        if cl.get('name'):
+            kv('name', cl['name'])
+    section('Scrollback')
+    kv('file', pane['scrollback_file'])
+    sb_path = snap_dir / pane['scrollback_file']
+    if sb_path.exists():
+        size = sb_path.stat().st_size
+        try:
+            lines = sum(1 for _ in sb_path.open('rb'))
+        except Exception:
+            lines = '?'
+        kv('size', f'{size:,} bytes, {lines} lines')
+
+
+def do_inspect(args):
+    root = pathlib.Path(args.dir)
+    snap_dir = resolve_snapshot(root, args.name, args.latest)
+    snap = json.loads((snap_dir / 'snapshot.json').read_text())
+
+    if args.pane:
+        m = re.fullmatch(r'([^:]+):(\d+)\.(\d+)', args.pane)
+        if not m:
+            sys.exit('error: --pane must look like SESSION:WINDOW.PANE (e.g. 0:12.1)')
+        s_name, w_i, p_i = m.group(1), int(m.group(2)), int(m.group(3))
+        pane = None
+        for s in snap['sessions']:
+            if s['name'] != s_name: continue
+            for w in s['windows']:
+                if w['index'] != w_i: continue
+                for p in w['panes']:
+                    if p['index'] == p_i:
+                        pane = p
+                        break
+        if not pane:
+            sys.exit(f'error: pane {args.pane} not in snapshot')
+        _show_pane_detail(snap_dir, args.pane, pane)
+        return
+
+    # ---- Whole-snapshot summary ----
+    name = snap.get('name', snap_dir.name)
+    banner(f'Snapshot  {name}')
+    sys.stdout.write('\n')
+
+    captured_iso = snap.get('captured_at', '')
+    age = relative_time(captured_iso)
+    captured_display = captured_iso + (f'   {dim(f"({age})")}' if age else '')
+    kv('path', str(snap_dir))
+    kv('captured', captured_display)
+    kv('host', snap.get('host', '?'))
+    kv('tmux', snap.get('tmux_version', '?'))
+    kv('scrollback', f'{snap.get("scrollback_lines", "?")} lines/pane')
+
+    n_sess = len(snap.get('sessions', []))
+    n_wins = sum(len(s.get('windows', [])) for s in snap.get('sessions', []))
+    n_panes = sum(len(w.get('panes', []))
+                  for s in snap.get('sessions', [])
+                  for w in s.get('windows', []))
+
+    stats = snap.get('stats', {})
+    idle = stats.get('idle_shells', 0)
+    rc = stats.get('restorable_counts', stats.get('restored_counts', {}))
+    nrp = stats.get('non_restorable_panes', stats.get('unrestored', []))
+    n_restorable_processes = sum(rc.values())
+
+    section(f'Pane summary  ({n_panes} panes total)')
+
+    label_w = 18
+    sys.stdout.write(f'  {bold("Idle shells".ljust(label_w))}  '
+                     f'{idle:>3}   {dim("plain zsh at original cwd")}\n')
+    sys.stdout.write('\n')
+    sys.stdout.write(f'  {bold("Restorable processes".ljust(label_w))}  '
+                     f'{n_restorable_processes:>3}\n')
+    if rc:
+        for k, v in sorted(rc.items(), key=lambda kv: -kv[1]):
+            sys.stdout.write(f'    {k:<{label_w - 2}}  {v:>3}\n')
+    else:
+        sys.stdout.write(f'    {dim("(none)")}\n')
+    sys.stdout.write('\n')
+    sys.stdout.write(f'  {bold("Non-restorable".ljust(label_w))}  '
+                     f'{len(nrp):>3}   {dim("scrollback only")}\n')
+    if nrp:
+        for u in nrp:
+            argv = truncate(u['fg_argv'] or '(unknown)', term_width() - 30)
+            sys.stdout.write(f'    {dim(u["address"]):<22} '
+                             f'{role_tag(u["role"], False)}  {argv}\n')
+
+    section(f'Windows  ({n_sess} session, {n_wins} windows)')
+
+    width = term_width()
+    for sess in snap.get('sessions', []):
+        for win in sess['windows']:
+            wname = win['name']
+            wmark = green(' *') if win.get('active') else '  '
+            addr = f'{sess["name"]}:{win["index"]}'
+            head = (f'  {bold(addr):<6}{wmark} {wname:<22}'
+                    f'  {win["width"]}×{win["height"]}'
+                    f'  {dim(str(len(win["panes"])) + " panes")}')
+            sys.stdout.write(head + '\n')
+            for pane in win['panes']:
+                amark = green('*') if pane.get('active') else ' '
+                fg = pane.get('foreground') or ''
+                cwd = tildefy(pane['cwd'])
+                # Reserve room for cwd; truncate fg first if total would overflow.
+                prefix = f'    .{pane["index"]:<2} {amark} {role_tag(pane["role"], pane.get("b_command") is not None or pane["restore_label"] == "idle_shell")}  '
+                visible_prefix_len = len(f'    .{pane["index"]:<2} {amark} [{pane["role"]:<11}]  ')
+                avail = max(20, width - visible_prefix_len - len(cwd) - 4)
+                fg_disp = truncate(fg, avail)
+                line = prefix + f'{fg_disp:<{avail}}  {dim(cwd)}'
+                sys.stdout.write(line + '\n')
+            sys.stdout.write('\n')
+
+
+# ---------- watch ----------
+
+def do_watch(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+    interval = parse_duration(args.interval)
+    root = pathlib.Path(args.dir)
+    root.mkdir(parents=True, exist_ok=True)
+    print(f'tmux-snap watch: dir={root} interval={args.interval} keep={args.keep} '
+          f'lines={args.lines}')
+
+    stop = {'flag': False}
+    def handler(signum, frame):
+        stop['flag'] = True
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+    while not stop['flag']:
+        # Take a snapshot using the same internal logic.
+        ns = argparse.Namespace(dir=str(root), name=auto_name(),
+                                lines=args.lines, force=False,
+                                verbose=args.verbose)
+        try:
+            do_save(ns)
+        except subprocess.CalledProcessError as e:
+            print(f'tmux-snap watch: save failed: {e}', file=sys.stderr)
+        except SystemExit as e:
+            print(f'tmux-snap watch: save exited: {e}', file=sys.stderr)
+        # Prune.
+        snaps = snapshots_in(root)
+        excess = len(snaps) - args.keep
+        if excess > 0:
+            import shutil
+            for path, _ in snaps[:excess]:
+                vlog(f'pruning {path.name}')
+                shutil.rmtree(path)
+        # Sleep, but wake on signal.
+        for _ in range(interval):
+            if stop['flag']:
+                break
+            time.sleep(1)
+    print('tmux-snap watch: stopping.')
+
+
+# ---------- main ----------
+
+def add_dir_arg(p):
+    p.add_argument('--dir', default=str(default_root()),
+                   help=f'snapshot root directory (default: {default_root()})')
+
+
+TOP_DESCRIPTION = """\
+tmux-snap — capture, restore, and manage tmux state snapshots.
+
+A snapshot records every session, window, and pane (sizes, layout, cwd, title,
+foreground process, scrollback with colors). Claude Code conversations are
+detected by walking each pane's process tree and stored by session UUID so they
+can be `claude -r`-resumed on restore. Other clean-restore commands (watch,
+caffeinate, http.server, tail -f, htop, ssh, less, …) are restored from their
+captured argv. Anything else is captured in scrollback only.
+"""
+
+TOP_EPILOG = """\
+Examples:
+  tmux-snap save                         # auto-named timestamped snapshot
+  tmux-snap save --name before-reboot    # named snapshot
+  tmux-snap list                         # show all snapshots
+  tmux-snap inspect --latest             # summarize the most recent one
+  tmux-snap inspect --pane 0:12.1        # drill into one pane
+  tmux-snap restore --latest --dry-run   # preview the restore commands
+  tmux-snap restore --name before-reboot --ask
+                                         # restore, asking per non-restorable pane
+                                         # whether to relaunch its captured argv
+  tmux-snap watch --interval 10m --keep 24
+                                         # rolling daemon: snap every 10m, keep 24
+
+Snapshot directory:
+  $TMUX_SNAP_DIR  →  $XDG_DATA_HOME/tmux-snap  →  ~/.local/share/tmux-snap
+  Override per-invocation with --dir.
+
+Snapshot layout on disk:
+  <dir>/<name>/snapshot.json           structured metadata for everything
+  <dir>/<name>/scrollback/*.raw        per-pane bytes, escape sequences kept
+  <dir>/<name>/init/*.sh               restore-time shell scripts (created on restore)
+  <dir>/latest                         symlink → most recent snapshot
+
+Run `tmux-snap <subcommand> --help` for details on each subcommand.
+"""
+
+SAVE_EPILOG = """\
+Examples:
+  tmux-snap save
+  tmux-snap save --name pre-deploy
+  tmux-snap save --lines 5000 --force
+"""
+
+RESTORE_EPILOG = """\
+Examples:
+  tmux-snap restore                       # restore the latest snapshot
+  tmux-snap restore --name pre-deploy
+  tmux-snap restore --latest --dry-run    # print tmux commands; run nothing
+  tmux-snap restore --ask                 # prompt per non-restorable pane (vim,
+                                          # build cmds, etc.) whether to relaunch
+                                          # its captured argv anyway
+  tmux-snap restore --target-width 250 --target-height 70
+                                          # force a target client size
+
+Notes:
+  - Refuses to clobber a tmux session whose name already exists; that session
+    is skipped (but others in the snapshot are still restored).
+  - Pane scrollback is `cat`'d into the restored pane, then a marker line, then
+    optional B-command (claude -r / watch / etc.), then `exec zsh` at original cwd.
+"""
+
+WATCH_EPILOG = """\
+Examples:
+  tmux-snap watch                                  # 10m interval, keep 24
+  tmux-snap watch --interval 5m --keep 48
+  nohup tmux-snap watch >/tmp/tmux-snap.log 2>&1 &
+                                                   # background it manually
+
+Duration units: s, m, h, d.  Bare integers are seconds.
+"""
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog='tmux-snap',
+        description=TOP_DESCRIPTION,
+        epilog=TOP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=True,
+    )
+    sub = p.add_subparsers(dest='cmd', metavar='<subcommand>', title='subcommands')
+
+    s = sub.add_parser('save', help='take a snapshot of the current tmux state',
+                       description='Capture the current tmux state to a snapshot directory.',
+                       epilog=SAVE_EPILOG,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dir_arg(s)
+    s.add_argument('--name', metavar='NAME',
+                   help='snapshot name (default: auto-generated timestamp like '
+                        '2026-04-30T14-23-11)')
+    s.add_argument('--lines', type=int, default=2000, metavar='N',
+                   help='scrollback lines captured per pane (default: 2000)')
+    s.add_argument('--force', action='store_true',
+                   help='overwrite an existing snapshot of the same name')
+    s.add_argument('-v', '--verbose', action='store_true',
+                   help='log every tmux command to stderr')
+
+    r = sub.add_parser('restore', help='restore a snapshot',
+                       description='Recreate tmux sessions, windows, and panes '
+                                   'from a snapshot.',
+                       epilog=RESTORE_EPILOG,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dir_arg(r)
+    r.add_argument('--name', metavar='NAME',
+                   help='snapshot name to restore (default: the latest)')
+    r.add_argument('--latest', action='store_true',
+                   help='explicitly restore the most recent snapshot '
+                        '(implied if --name is omitted)')
+    r.add_argument('--dry-run', action='store_true',
+                   help='print tmux commands to stdout, run nothing')
+    r.add_argument('--ask', action='store_true',
+                   help='for each pane without a restore policy, prompt y/N to '
+                        'relaunch its captured argv')
+    r.add_argument('--target-width', type=int, metavar='COLS',
+                   help='target tmux client width in cells (default: current terminal)')
+    r.add_argument('--target-height', type=int, metavar='ROWS',
+                   help='target tmux client height in cells (default: current terminal)')
+    r.add_argument('--force', action='store_true',
+                   help='kill any existing session whose name matches the snapshot, '
+                        'and restore even when run from inside tmux ($TMUX set)')
+    r.add_argument('-v', '--verbose', action='store_true',
+                   help='log every tmux command to stderr')
+
+    l = sub.add_parser('list', help='list snapshots in the directory',
+                       description='Show every snapshot in the snapshot directory '
+                                   'with age and a compact restore summary. The '
+                                   'latest snapshot is marked with " *".',
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dir_arg(l)
+
+    i = sub.add_parser('inspect', help='show details about a snapshot or pane',
+                       description='Pretty-print a snapshot. With --pane, drill '
+                                   'into a single pane.',
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dir_arg(i)
+    i.add_argument('--name', metavar='NAME',
+                   help='snapshot name to inspect (default: the latest)')
+    i.add_argument('--latest', action='store_true',
+                   help='inspect the most recent snapshot (implied if --name omitted)')
+    i.add_argument('--pane', metavar='ADDRESS',
+                   help='show full detail for one pane, addressed as '
+                        'SESSION:WINDOW.PANE (e.g. 0:12.1)')
+
+    w = sub.add_parser('watch', help='run a daemon that snapshots periodically',
+                       description='Foreground daemon: takes a snapshot on every '
+                                   'interval, prunes oldest beyond --keep. '
+                                   'Stop with Ctrl-C.',
+                       epilog=WATCH_EPILOG,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dir_arg(w)
+    w.add_argument('--interval', default='10m', metavar='DUR',
+                   help='time between snapshots (e.g. 30s, 10m, 1h, 1d). Default: 10m')
+    w.add_argument('--keep', type=int, default=24, metavar='N',
+                   help='maximum number of snapshots to retain (default: 24)')
+    w.add_argument('--lines', type=int, default=2000, metavar='N',
+                   help='scrollback lines per pane (default: 2000)')
+    w.add_argument('-v', '--verbose', action='store_true',
+                   help='log every tmux command to stderr')
+
+    args = p.parse_args()
+    if args.cmd is None:
+        p.print_help()
+        sys.exit(0)
+    return globals()[f'do_{args.cmd}'](args)
+
+
+if __name__ == '__main__':
+    main()
